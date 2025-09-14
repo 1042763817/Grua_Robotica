@@ -1,0 +1,222 @@
+from machine import Pin, ADC, PWM
+import time
+# Configuraciòn Pines
+
+# Servos (PWM, 50 Hz)
+servo_base = PWM(Pin(23), freq=50)
+servo_brazo = PWM(Pin(22), freq=50)
+
+# Potenciómetros (ADC)
+pot_base = ADC(Pin(34))   # 12 bits
+pot_brazo = ADC(Pin(35))  # 10 bits
+
+pot_base.atten(ADC.ATTN_11DB)   
+pot_brazo.atten(ADC.ATTN_11DB)
+
+pot_base.width(ADC.WIDTH_12BIT)   # 0-4095
+pot_brazo.width(ADC.WIDTH_10BIT)  # 0-1023
+
+# Botones con interrupción (usar resistencias internas pull-up)
+btn_retorno = Pin(18, Pin.IN, Pin.PULL_UP)
+btn_rutina  = Pin(19, Pin.IN, Pin.PULL_UP)
+
+# LEDs 
+led_verde = Pin(15, Pin.OUT)
+led_rojo  = Pin(4, Pin.OUT)
+
+# Buzzer (PWM pasivo)
+buzzer = PWM(Pin(5), freq=2000)
+buzzer.duty_u16(0)
+
+# Variables de estado
+
+modo_manual = True
+ejecutando_auto = False
+ultimo_irq_retorno = 0
+ultimo_irq_rutina = 0
+DEBOUNCE_MS = 200
+
+# Movimiento 
+
+
+def angulo_a_duty(angle):
+    """Convierte ángulo (0–180°) a duty_u16 para PWM 50Hz"""
+    us = 500 + (angle/180) * 2000   # pulso en microsegundos
+    duty = int((us / 20000) * 65535)
+    return duty
+
+def mover_servo(servo, angle):
+    servo.duty_u16(angulo_a_duty(angle))
+
+def leer_potenciometros():
+    """Lee potenciómetros y devuelve ángulos"""
+    val_base = pot_base.read()
+    val_brazo = pot_brazo.read()
+    ang_base = int((val_base / 4095) * 180)
+    ang_brazo = int((val_brazo / 1023) * 180)
+    return ang_base, ang_brazo
+
+def buzzer_on():
+    buzzer.duty_u16(20000)
+
+def buzzer_off():
+    buzzer.duty_u16(0)
+
+# RUTINA 
+
+def retorno_inicial(pin):
+    global ultimo_irq_retorno
+    now = time.ticks_ms()
+    if time.ticks_diff(now, ultimo_irq_retorno) < DEBOUNCE_MS:
+        return
+    ultimo_irq_retorno = now
+
+    global modo_manual, ejecutando_auto
+    if ejecutando_auto:
+        return
+    ejecutando_auto = True
+    modo_manual = False
+    rutina_retorno()
+
+def rutina_predefinida(pin):
+    global ultimo_irq_rutina
+    now = time.ticks_ms()
+    if time.ticks_diff(now, ultimo_irq_rutina) < DEBOUNCE_MS:
+        return
+    ultimo_irq_rutina = now
+
+    global modo_manual, ejecutando_auto
+    if ejecutando_auto:
+        return
+    ejecutando_auto = True
+    modo_manual = False
+    rutina_movimientos()
+
+def rutina_retorno():
+    """Mover servos a posición inicial"""
+    led_rojo.on()
+    led_verde.off()
+    buzzer_on()
+    print("[INFO] Retorno a posición inicial...")
+
+    for ang in range(180, 90, -5):  # base al centro
+        mover_servo(servo_base, ang)
+        time.sleep(0.05)
+    for ang in range(180, 0, -5):   # brazo abajo
+        mover_servo(servo_brazo, ang)
+        time.sleep(0.05)
+
+    buzzer_off()
+    led_rojo.off()
+    led_verde.on()
+    global ejecutando_auto, modo_manual
+    ejecutando_auto = False
+    modo_manual = True
+    print("[OK] Retorno completado.")
+
+def rutina_movimientos():
+    """Rutina de movimientos predefinida"""
+    led_rojo.on()
+    led_verde.off()
+    buzzer_on()
+    print("[INFO] Ejecutando rutina predefinida...")
+
+    for ang in range(90, 150, 5):
+        mover_servo(servo_base, ang)
+        mover_servo(servo_brazo, 60)
+        time.sleep(0.05)
+    for ang in range(150, 30, -5):
+        mover_servo(servo_base, ang)
+        mover_servo(servo_brazo, 120)
+        time.sleep(0.05)
+
+    buzzer_off()
+    rutina_retorno()
+    print("[OK] Rutina predefinida finalizada.")
+
+
+# REFLEJOS 
+
+
+def prueba_reflejos():
+    """Genera estímulo aleatorio y mide tiempo de reacción"""
+    import urandom
+    print("[TEST] Prueba de reflejos iniciada. Espera estímulo...")
+
+    led_rojo.off()
+    led_verde.off()
+    time.sleep_ms(500)
+
+    delay = urandom.getrandbits(12) % 3000 + 1000  # entre 1–4 s
+    time.sleep_ms(delay)
+
+    # estímulo
+    led_rojo.on()
+    buzzer_on()
+    inicio = time.ticks_us()
+
+    timeout = 5000
+    t0 = time.ticks_ms()
+    reaccion = None
+    while time.ticks_diff(time.ticks_ms(), t0) < timeout:
+        if btn_retorno.value() == 0:   
+            reaccion = time.ticks_us()
+            break
+
+    buzzer_off()
+    led_rojo.off()
+    led_verde.on()
+
+    if reaccion is None:
+        print("[FAIL] No hubo respuesta en 5s. Score = 0")
+        return 0
+
+    delta_ms = time.ticks_diff(reaccion, inicio) // 1000
+    score = calcular_score(delta_ms)
+    print("[RESULT] Tiempo:", delta_ms, "ms | Score:", score)
+    return score
+
+def calcular_score(ms):
+    """Escala tiempo de reacción a puntaje (0–100)"""
+    if ms <= 150:
+        return 100
+    elif ms >= 2000:
+        return 0
+    else:
+        return int(100 * (1 - (ms - 150) / (2000 - 150)))
+
+
+# INTERRUPCIONES
+
+btn_retorno.irq(trigger=Pin.IRQ_FALLING, handler=retorno_inicial)
+btn_rutina.irq(trigger=Pin.IRQ_FALLING, handler=rutina_predefinida)
+
+#  bucle principal
+
+led_verde.on()
+led_rojo.off()
+
+print("Sistema de Control de Grúa Robotica")
+print("Modo inicial: MANUAL")
+print("Use potenciómetros para controlar. \n Use Botón 18 = para Retorno.\n Use Botón 19 = Rutina.\n")
+print("Se ejecutará prueba de reflejos al final de la rutina.\n")
+
+try:
+    while True:
+        if modo_manual:
+            ang_base, ang_brazo = leer_potenciometros()
+            mover_servo(servo_base, ang_base)
+            mover_servo(servo_brazo, ang_brazo)
+            time.sleep(0.05)
+
+        # tras cada rutina, corre prueba de reflejos
+        if not modo_manual and not ejecutando_auto:
+            score = prueba_reflejos()
+            modo_manual = True
+            ejecutando_auto = False
+
+except KeyboardInterrupt:
+    print("\n[EXIT] Programa detenido.")
+    buzzer_off()
+    servo_base.deinit()
+    servo_brazo.deinit()
